@@ -54,6 +54,7 @@ bnn-infer-v2.c         推理命令行入口（llm / classify）
 tests/accelerator/     加速器 API 与软件参考数值边界回归测试
 tools/                 Qwen3 NumPy 参考、精度分析 (precision/)、gguf-lens、wave-deck、Unicode 表生成
 train/                 训练与模型导出脚本（Qwen3 / MNIST-MLP）
+references/            参考开源加速器项目（Git Submodules：`tvm-vta`、`redmule`、`gemmini`）
 ```
 
 ---
@@ -141,7 +142,7 @@ make -C bnn-hw-v2/sta
 - **硬件微架构、ISA、算术契约与仿真协议**：详见 [`bnn-hw-v2/README.md`](bnn-hw-v2/README.md)
 - **Accelerator API v2、内存视图、量化语义与 GGUF 布局取舍**：详见 [`bnn-accelerator/README.md`](bnn-accelerator/README.md)
 - **55nm 综合流程、Corner 选择与 STA 限制说明**：详见 [`bnn-hw-v2/sta/README.md`](bnn-hw-v2/sta/README.md)
-- **精度对比与检视工具**：[`tools/precision/README.md`](tools/precision/README.md)、[`tools/gguf-lens/README.md`](tools/gguf-lens/README.md)、[`tools/wave-deck/README.md`](tools/wave-deck/README.md)
+- **精度对比与检视工具**：[`tools/precision/README.md`](tools/precision/README.md)、[`tools/gguf-lens/README.md`](tools/gguf-lens/README.md)、[`tools/wave-deck/README.md`](tools/wave-deck/README.md)、[`tools/arch-atlas/README.md`](tools/arch-atlas/README.md)
 
 ---
 

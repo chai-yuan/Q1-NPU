@@ -1,0 +1,9 @@
+[submodule "references/tvm-vta"]
+	path = references/tvm-vta
+	url = https://github.com/apache/tvm-vta.git
+[submodule "references/redmule"]
+	path = references/redmule
+	url = https://github.com/pulp-platform/redmule.git
+[submodule "references/gemmini"]
+	path = references/gemmini
+	url = https://github.com/ucb-bar/gemmini.git

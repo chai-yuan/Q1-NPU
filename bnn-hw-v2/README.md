@@ -1,12 +1,15 @@
 # BNN 硬件加速器 v2 (`bnn-hw-v2`)
 
-本目录包含 BNN v2 计算核心的可综合 SystemVerilog RTL 实现（`bnn_core/`）、供各 C++ testbench 共用的 Verilator 仿真硬件顶层（`bnn_sim_top/`）、基于 Verilator + DPI-C 的离线回归环境（`simple_test/`）与 TCP 协同仿真环境（`remote_sim/`），以及待接入片外 AXI4 总线的顶层骨架（`bnn_top.sv`）。
+本目录包含 BNN v2 计算核心与 Zynq SoC 接入顶层的可综合 SystemVerilog RTL 实现（`bnn_core/`）、供各 C++ testbench 共用的 Verilator 仿真硬件顶层（`bnn_sim_top/`）、基于 Verilator + DPI-C 的离线回归环境（`simple_test/`）与 TCP 协同仿真环境（`remote_sim/`），以及 post-synthesis 时序面积分析流程（`sta/`）。
 
 ## 目录与模块划分
 
 ```text
 bnn-hw-v2/
-├── bnn_core/                  # 协议无关的 BNN v2 计算核心 RTL
+├── bnn_core/                  # BNN v2 计算核心与 Zynq SoC AXI 接入层 RTL
+│   ├── bnn_soc_top.sv         # Zynq SoC 标准 IP 顶层（s_axi_control + 64b/128b m_axi_gmem）
+│   ├── bnn_soc_ctrl.sv        # AXI4-Lite 从设备控制/状态寄存器与 MMIO 单条指令直推单元
+│   ├── bnn_soc_dma.sv         # 核心 128b DMA <-> 64b/128b AXI4 Master 齿轮箱与 4KiB 突发切分
 │   ├── bnn_fp_math.sv         # 可综合浮点/量化算术包（FP16->FP32、FTZ/RTZ 乘加、除 127、INT8 量化）
 │   ├── bnn_core_top.sv        # 计算核心顶层：组装 6 个功能子模块、Weight SRAM 与读 DMA MUX
 │   ├── bnn_top_controller.sv  # 64-bit 单阶段原子指令控制器与全局状态机
@@ -18,11 +21,10 @@ bnn-hw-v2/
 │   ├── sram_result_wrapper.sv # Result SRAM 浅包装（带字节写掩码的单端口 1RW SRAM 宏，默认 4096 x 128-bit）
 │   ├── bnn_output_accum.sv    # 结果 SRAM 访问层：跨 K 块 FP32 覆盖/累加后处理与 session 握手
 │   └── bnn_output_writer.sv   # Output SRAM -> 外部内存 2D 步长突发写回与尾列字节掩码生成
-├── bnn_sim_top/               # Verilator 仿真硬件顶层（DPI-C 命令流/数据存储器适配，供多个 C++ testbench 复用）
+├── bnn_sim_top/               # Verilator 统一仿真顶层（AXI4-Lite Master + 64b AXI4 Slave 驱动 bnn_soc_top）
 ├── simple_test/               # Verilator + DPI-C 离线回归：CLI 运行器与全套固定用例
-├── remote_sim/                # Verilator + TCP 协同仿真：命令/内存 RPC server 与 mock 客户端
-├── sta/                       # Yosys + OpenSTA 的 post-synthesis Fmax/面积分析报告
-└── bnn_top.sv                 # 外层 AXI4 + 128-bit 指令接口顶层封装骨架（尚未接入内部引擎）
+├── remote_sim/                # Verilator + TCP 协同仿真：MMIO 寄存器/AXI 内存 RPC server 与客户端
+└── sta/                       # Yosys + OpenSTA 的 post-synthesis Fmax/面积分析报告
 ```
 
 ## 硬件设计 (`bnn_core/`)
@@ -123,13 +125,14 @@ make -C bnn-hw-v2/simple_test gen     # 从 Qwen3-zh-5k GGUF 重新生成用例�
 
 ## 远程协同仿真 (`remote_sim/`)
 
-`remote_sim/` 提供一个最小化的 TCP 协同仿真：仿真进程在本地监听，上层软件栈作为
-客户端通过 16 字节头 + payload 的二进制协议发送 64-bit 指令、响应内存读写，并接收
-指令完成回包。指令一次一条（收到 `CMD_DONE` 后再发下一条）；仿真在无命令时不推进
-时钟，因此周期数不随网络延迟变化。读通道在 DMA 命令握手时用一条 `READ_BURST`
-预取整笔突发，后续逐 64-bit 读命中本地缓存。固定用例经 TCP 跑出的周期为 101890，
-比文件驱动的 `simple_test` 多 63 拍，来自“等待完成后再发下一条”的协议开销；墙钟
-约 0.5s（预取前约 1.2s）。
+`remote_sim/` 以 `bnn_soc_top` 为被测核心提供全真 SoC 模式的 TCP 协同仿真：上层软件栈像在
+Zynq ARM 上操作真实内存映射外设一样，通过 `MMIO_WRITE / MMIO_READ` 读写 `s_axi_control`
+寄存器（启动校验 `CORE_ID = 0x424E4E32`、配置 `DATA_BASE`、写入 `CMD_LO / CMD_HI`、触发
+`CTRL_STATUS.LAUNCH` 并轮询 `DONE / ERROR`），同时在后台响应仿真器 `m_axi_gmem` 64-bit AXI4
+主接口发起的 `READ_BURST / READ / WRITE` 内存事务。核心 `BUSY` 期间，状态轮询默认按
+`--mmio-poll-cycles 128` 节流（核心一旦转为空闲立即放行），仿真在无工作且无待处理 MMIO 请求时
+暂停推进时钟，使固定用例在 `simple_test` 与 `remote_sim` 下跑出完全一致的 `106868` 周期（其中硬件
+`CYCLE_CNT = 106144`），墙钟约 0.67s。
 
 主循环内置周期级性能探针：每拍采样一次，统计每个探针的命中周期数、触发次数、
 平均/最长持续时间，进程退出时打印汇总及墙钟/仿真速度/等待主机的时长。增删探针只需

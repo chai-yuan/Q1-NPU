@@ -47,18 +47,38 @@
 #define REMOTE_MAX_MEM        (3u << 30)
 
 #define REMOTE_MAGIC          0x424E4E53u
-#define TYPE_CMD              0x01u
 #define TYPE_READ             0x02u
 #define TYPE_WRITE            0x03u
 #define TYPE_QUIT             0x04u
 #define TYPE_READ_BURST       0x05u
+#define TYPE_MMIO_WRITE       0x10u
+#define TYPE_MMIO_READ        0x11u
 #define TYPE_READ_RSP         0x81u
-#define TYPE_CMD_DONE         0x82u
 #define TYPE_QUIT_ACK         0x83u
 #define TYPE_READ_BURST_RSP   0x85u
+#define TYPE_MMIO_WRITE_RSP   0x90u
+#define TYPE_MMIO_READ_RSP    0x91u
 
 #define HEADER_BYTES          16u
 #define MAX_MESSAGE_PAYLOAD   8u
+
+/* bnn_soc_ctrl AXI4-Lite MMIO register map (matches bnn_soc_ctrl.sv) */
+#define REG_CTRL_STATUS       0x00u
+#define REG_CYCLE_CNT         0x04u
+#define REG_CMD_LO            0x08u
+#define REG_CMD_HI            0x0Cu
+#define REG_DATA_BASE_LO      0x10u
+#define REG_DATA_BASE_HI      0x14u
+#define REG_CMD_DONE_CNT      0x18u
+#define REG_ERR_CODE          0x1Cu
+#define REG_CORE_ID           0x20u
+
+#define BNN_SOC_MAGIC_ID      0x424E4E32u /* "BNN2" */
+#define CTRL_LAUNCH           (1u << 0)
+#define CTRL_DONE             (1u << 1)
+#define CTRL_BUSY             (1u << 2)
+#define CTRL_ERROR            (1u << 3)
+#define CTRL_SOFT_RESET       (1u << 4)
 
 #define OP_SET_SRC_STRIDE     0x01u
 #define OP_SET_DST_STRIDE     0x02u
@@ -220,29 +240,59 @@ static int serve_memory(BNN_Device device, const Message* message) {
     return 0;
 }
 
-static BNN_Status pump_completions(BNN_Device device, uint32_t expected) {
-    uint32_t completed = 0;
-    while (completed < expected) {
+static int mmio_write32(BNN_Device device, uint16_t offset, uint32_t value) {
+    uint8_t payload[4];
+    uint16_t seq = ++device->next_seq;
+    put_u32(payload, value);
+    if (!send_message(device->fd, TYPE_MMIO_WRITE, 0x0Fu, seq, offset,
+                      payload, 4))
+        return 0;
+    for (;;) {
         Message message;
         if (!recv_message(device->fd, &message))
-            return BNN_EIO;
-        if (message.type == TYPE_CMD_DONE) {
-            if (message.flags & 1u)
-                return BNN_EIO;
-            ++completed;
-        } else if (!serve_memory(device, &message)) {
-            return BNN_EIO;
+            return 0;
+        if (message.type == TYPE_MMIO_WRITE_RSP) {
+            return message.seq == seq && message.flags == 0;
         }
+        if (!serve_memory(device, &message))
+            return 0;
     }
-    return BNN_OK;
 }
 
-static int send_instruction(BNN_Device device, uint64_t instruction) {
-    uint8_t payload[8];
-    for (int byte = 0; byte < 8; ++byte)
-        payload[byte] = (uint8_t)(instruction >> (8 * byte));
-    return send_message(device->fd, TYPE_CMD, 0, ++device->next_seq, 0,
-                        payload, 8);
+static int mmio_read32(BNN_Device device, uint16_t offset, uint32_t* out_value) {
+    uint16_t seq = ++device->next_seq;
+    if (!send_message(device->fd, TYPE_MMIO_READ, 0, seq, offset, NULL, 0))
+        return 0;
+    for (;;) {
+        Message message;
+        if (!recv_message(device->fd, &message))
+            return 0;
+        if (message.type == TYPE_MMIO_READ_RSP) {
+            if (message.seq != seq || message.flags != 0 || message.length != 4)
+                return 0;
+            *out_value = get_u32(message.payload);
+            return 1;
+        }
+        if (!serve_memory(device, &message))
+            return 0;
+    }
+}
+
+static BNN_Status exec_instruction(BNN_Device device, uint64_t instruction) {
+    if (!mmio_write32(device, REG_CMD_LO, (uint32_t)instruction) ||
+        !mmio_write32(device, REG_CMD_HI, (uint32_t)(instruction >> 32)) ||
+        !mmio_write32(device, REG_CTRL_STATUS, CTRL_LAUNCH))
+        return BNN_EIO;
+
+    for (;;) {
+        uint32_t status = 0;
+        if (!mmio_read32(device, REG_CTRL_STATUS, &status))
+            return BNN_EIO;
+        if (status & CTRL_ERROR)
+            return BNN_EIO;
+        if (status & CTRL_DONE)
+            return BNN_OK;
+    }
 }
 
 static uint32_t alloc_device(BNN_Device device, size_t bytes) {
@@ -387,6 +437,19 @@ BNN_Status BNN_DeviceOpen(uint32_t device_index, BNN_Device* out_device) {
         free(device->memory);
         free(device);
         return BNN_ENOMEM;
+    }
+    {
+        uint32_t core_id = 0;
+        if (!mmio_read32(device, REG_CORE_ID, &core_id) ||
+            core_id != BNN_SOC_MAGIC_ID ||
+            !mmio_write32(device, REG_CTRL_STATUS, CTRL_SOFT_RESET) ||
+            !mmio_write32(device, REG_DATA_BASE_LO, 0u) ||
+            !mmio_write32(device, REG_DATA_BASE_HI, 0u)) {
+            close(fd);
+            free(device->memory);
+            free(device);
+            return BNN_EIO;
+        }
     }
     *out_device = device;
     return BNN_OK;
@@ -577,7 +640,6 @@ BNN_Status BNN_Execute(BNN_Device device, const BNN_Job* job) {
     uint32_t hw_src_stride;
     uint32_t hw_dst_stride;
     int dst_copy = 0;
-    uint32_t expected;
     BNN_Status status;
 
     if (device == NULL || job == NULL || job->matrix == NULL ||
@@ -665,12 +727,14 @@ BNN_Status BNN_Execute(BNN_Device device, const BNN_Job* job) {
         hw_dst_stride = (uint32_t)((out_row_bytes + 15u) & ~15u);
     }
 
-    expected = 2u + 2u * matrix->k_tiles + 1u;
-    if (!send_instruction(device,
-                          ((uint64_t)hw_src_stride << 32) | OP_SET_SRC_STRIDE) ||
-        !send_instruction(device,
-                          ((uint64_t)hw_dst_stride << 32) | OP_SET_DST_STRIDE))
-        return BNN_EIO;
+    status = exec_instruction(device,
+                              ((uint64_t)hw_src_stride << 32) | OP_SET_SRC_STRIDE);
+    if (status != BNN_OK)
+        return status;
+    status = exec_instruction(device,
+                              ((uint64_t)hw_dst_stride << 32) | OP_SET_DST_STRIDE);
+    if (status != BNN_OK)
+        return status;
 
     for (uint32_t tile = 0; tile < matrix->k_tiles; ++tile) {
         uint64_t load = ((uint64_t)matrix->blocks[tile] << 32) |
@@ -679,19 +743,18 @@ BNN_Status BNN_Execute(BNN_Device device, const BNN_Job* job) {
         uint64_t compute;
         uint32_t compute_addr = src_addr +
             (uint32_t)((size_t)tile * REMOTE_GROUP_SIZE * elem_bytes);
-        if (!send_instruction(device, load))
-            return BNN_EIO;
+        status = exec_instruction(device, load);
+        if (status != BNN_OK)
+            return status;
         compute = ((uint64_t)compute_addr << 32) |
                   (tile != 0 ? (1ull << 24) : 0ull) |
                   (is_f32 ? 0ull : (1ull << 25)) |
                   ((uint64_t)rows << 8) | OP_COMPUTE;
-        if (!send_instruction(device, compute))
-            return BNN_EIO;
+        status = exec_instruction(device, compute);
+        if (status != BNN_OK)
+            return status;
     }
-    if (!send_instruction(device, ((uint64_t)dst_addr << 32) | OP_WRITEBACK))
-        return BNN_EIO;
-
-    status = pump_completions(device, expected);
+    status = exec_instruction(device, ((uint64_t)dst_addr << 32) | OP_WRITEBACK);
     if (status != BNN_OK)
         return status;
 

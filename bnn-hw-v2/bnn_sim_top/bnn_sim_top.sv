@@ -2,24 +2,27 @@
 
 /*
 ============================================================================
-bnn_sim_top (BNN v2 最小 Verilator 仿真顶层)
+bnn_sim_top (BNN v2 面向 SoC 顶层的 Verilator 统一仿真顶层)
 ----------------------------------------------------------------------------
-对外只有 clock/reset/finish 和少量状态输出。命令流和数据访问全部由仿真存储
-模块通过 DPI-C 自动完成：
+将真实的 Zynq SoC 接入顶层 bnn_soc_top 置于仿真中心，宿主机通过标准 AXI4-Lite
+读写控制寄存器（s_axi_control_*），数据访存全程穿过 64-bit AXI4 Master 总线
+（m_axi_gmem_*）：
 
-  bnn_sim_cmd_stream  -- cmd_check()/cmd_get() --> 线性命令流
-  bnn_sim_data_memory -- data_read()/data_write() --> 统一数据存储器
+  bnn_sim_cmd_stream  -- DPI mmio_*()   --> s_axi_control_* (32-bit AXI4-Lite)
+  bnn_soc_top         -- 真实 SoC 顶层  --> bnn_soc_ctrl + bnn_core_top + bnn_soc_dma
+  bnn_sim_data_memory <-- DPI data_*()  <-- m_axi_gmem_*    (64-bit AXI4 Full)
 
-finish 由 testbench 在确认不会再有新指令时拉高；此前即使命令队列为空也不会
-结束，便于交互式/网络化仿真。finish 有效且核心/DMA 空闲后自动 $finish。
-
-状态输出供 testbench 观测：busy_out 为核心/DMA 忙，cmd_done_out/cmd_error_out
-为单拍指令完成/错误脉冲，error_out 为命令流锁存的错误状态（核心拒绝指令后
-保持高电平并停止取指，由 testbench 决定如何终止）。具体 DPI-C 存储模型由
-C++ 侧实现。
+finish 由 testbench 在确认所有宿主机 MMIO 交互均已结束后拉高；当无在途 MMIO 事务且
+SoC/AXI 从机全部空闲时自动 $finish。
 ============================================================================
 */
-module bnn_sim_top (
+module bnn_sim_top #(
+    parameter int unsigned C_S_AXI_CONTROL_ADDR_WIDTH = 16,
+    parameter int unsigned C_S_AXI_CONTROL_DATA_WIDTH = 32,
+    parameter int unsigned C_M_AXI_GMEM_ID_WIDTH      = 8,
+    parameter int unsigned C_M_AXI_GMEM_ADDR_WIDTH    = 32,
+    parameter int unsigned C_M_AXI_GMEM_DATA_WIDTH    = 64
+) (
     input  wire clock,
     input  wire reset,
     input  wire finish,
@@ -28,126 +31,255 @@ module bnn_sim_top (
     output wire command_active,
     output wire cmd_done_out,
     output wire cmd_error_out,
-    output wire error_out
+    output wire error_out,
+    output wire irq_out
 );
-    localparam int unsigned DMA_DATA_WIDTH = 128;
-    localparam int unsigned DMA_LEN_WIDTH  = 16;
+    // ------------------------------------------------------------------------
+    // AXI4-Lite 控制总线连线 (bnn_sim_cmd_stream -> bnn_soc_top)
+    // ------------------------------------------------------------------------
+    wire                                       s_axi_control_AWVALID;
+    wire                                       s_axi_control_AWREADY;
+    wire [C_S_AXI_CONTROL_ADDR_WIDTH-1:0]      s_axi_control_AWADDR;
+    wire                                       s_axi_control_WVALID;
+    wire                                       s_axi_control_WREADY;
+    wire [C_S_AXI_CONTROL_DATA_WIDTH-1:0]      s_axi_control_WDATA;
+    wire [(C_S_AXI_CONTROL_DATA_WIDTH/8)-1:0]  s_axi_control_WSTRB;
+    wire                                       s_axi_control_BVALID;
+    wire                                       s_axi_control_BREADY;
+    wire [1:0]                                 s_axi_control_BRESP;
+    wire                                       s_axi_control_ARVALID;
+    wire                                       s_axi_control_ARREADY;
+    wire [C_S_AXI_CONTROL_ADDR_WIDTH-1:0]      s_axi_control_ARADDR;
+    wire                                       s_axi_control_RVALID;
+    wire                                       s_axi_control_RREADY;
+    wire [C_S_AXI_CONTROL_DATA_WIDTH-1:0]      s_axi_control_RDATA;
+    wire [1:0]                                 s_axi_control_RRESP;
 
-    wire                             cmd_valid;
-    wire [63:0]                      cmd_inst;
-    wire                             cmd_ready;
-    wire                             cmd_done;
-    wire                             cmd_error;
-    wire                             status_busy;
+    // ------------------------------------------------------------------------
+    // AXI4 数据总线连线 (bnn_soc_top -> bnn_sim_data_memory)
+    // ------------------------------------------------------------------------
+    wire                                       m_axi_gmem_AWVALID;
+    wire                                       m_axi_gmem_AWREADY;
+    wire [C_M_AXI_GMEM_ADDR_WIDTH-1:0]         m_axi_gmem_AWADDR;
+    wire [C_M_AXI_GMEM_ID_WIDTH-1:0]           m_axi_gmem_AWID;
+    wire [0:0]                                 m_axi_gmem_AWUSER;
+    wire [7:0]                                 m_axi_gmem_AWLEN;
+    wire [2:0]                                 m_axi_gmem_AWSIZE;
+    wire [1:0]                                 m_axi_gmem_AWBURST;
+    wire [1:0]                                 m_axi_gmem_AWLOCK;
+    wire [3:0]                                 m_axi_gmem_AWCACHE;
+    wire [2:0]                                 m_axi_gmem_AWPROT;
+    wire [3:0]                                 m_axi_gmem_AWQOS;
+    wire [3:0]                                 m_axi_gmem_AWREGION;
 
-    wire                             mem_rd_cmd_valid;
-    wire                             mem_rd_cmd_ready;
-    wire [31:0]                      mem_rd_cmd_addr;
-    wire [DMA_LEN_WIDTH-1:0]         mem_rd_cmd_len;
-    wire                             mem_rd_data_valid;
-    wire                             mem_rd_data_ready;
-    wire [DMA_DATA_WIDTH-1:0]        mem_rd_data;
-    wire                             mem_rd_data_last;
+    wire                                       m_axi_gmem_WVALID;
+    wire                                       m_axi_gmem_WREADY;
+    wire [C_M_AXI_GMEM_DATA_WIDTH-1:0]         m_axi_gmem_WDATA;
+    wire [(C_M_AXI_GMEM_DATA_WIDTH/8)-1:0]     m_axi_gmem_WSTRB;
+    wire                                       m_axi_gmem_WLAST;
+    wire [C_M_AXI_GMEM_ID_WIDTH-1:0]           m_axi_gmem_WID;
+    wire [0:0]                                 m_axi_gmem_WUSER;
 
-    wire                             mem_wr_cmd_valid;
-    wire                             mem_wr_cmd_ready;
-    wire [31:0]                      mem_wr_cmd_addr;
-    wire [DMA_LEN_WIDTH-1:0]         mem_wr_cmd_len;
-    wire                             mem_wr_data_valid;
-    wire                             mem_wr_data_ready;
-    wire [DMA_DATA_WIDTH-1:0]        mem_wr_data;
-    wire [DMA_DATA_WIDTH/8-1:0]      mem_wr_data_strb;
-    wire                             mem_wr_data_last;
-    wire                             mem_wr_done;
+    wire                                       m_axi_gmem_BVALID;
+    wire                                       m_axi_gmem_BREADY;
+    wire [1:0]                                 m_axi_gmem_BRESP;
+    wire [C_M_AXI_GMEM_ID_WIDTH-1:0]           m_axi_gmem_BID;
+    wire [0:0]                                 m_axi_gmem_BUSER;
 
-    wire                             rd_busy;
-    wire                             wr_busy;
-    wire                             busy;
-    wire                             done;
-    wire                             error;
+    wire                                       m_axi_gmem_ARVALID;
+    wire                                       m_axi_gmem_ARREADY;
+    wire [C_M_AXI_GMEM_ADDR_WIDTH-1:0]         m_axi_gmem_ARADDR;
+    wire [C_M_AXI_GMEM_ID_WIDTH-1:0]           m_axi_gmem_ARID;
+    wire [0:0]                                 m_axi_gmem_ARUSER;
+    wire [7:0]                                 m_axi_gmem_ARLEN;
+    wire [2:0]                                 m_axi_gmem_ARSIZE;
+    wire [1:0]                                 m_axi_gmem_ARBURST;
+    wire [1:0]                                 m_axi_gmem_ARLOCK;
+    wire [3:0]                                 m_axi_gmem_ARCACHE;
+    wire [2:0]                                 m_axi_gmem_ARPROT;
+    wire [3:0]                                 m_axi_gmem_ARQOS;
+    wire [3:0]                                 m_axi_gmem_ARREGION;
 
-    assign busy = status_busy || rd_busy || wr_busy;
+    wire                                       m_axi_gmem_RVALID;
+    wire                                       m_axi_gmem_RREADY;
+    wire [C_M_AXI_GMEM_DATA_WIDTH-1:0]         m_axi_gmem_RDATA;
+    wire [1:0]                                 m_axi_gmem_RRESP;
+    wire                                       m_axi_gmem_RLAST;
+    wire [C_M_AXI_GMEM_ID_WIDTH-1:0]           m_axi_gmem_RID;
+    wire [0:0]                                 m_axi_gmem_RUSER;
+
+    wire rd_busy;
+    wire wr_busy;
+    wire done;
+    wire irq;
+
+    // 仿真白盒观测信号（不影响可综合 bnn_soc_top 端口）
+    wire soc_busy   = u_soc.u_soc_ctrl.busy;
+    wire busy       = !reset && (soc_busy || rd_busy || wr_busy);
 
     assign busy_out      = busy;
-    assign cmd_done_out  = cmd_done;
-    assign cmd_error_out = cmd_error;
-    assign error_out     = error;
+    assign cmd_done_out  = !reset && u_soc.core_cmd_done;
+    assign cmd_error_out = !reset && u_soc.core_cmd_error;
+    assign error_out     = !reset && u_soc.u_soc_ctrl.error_flag;
+    assign irq_out       = irq;
 
-    bnn_sim_cmd_stream u_cmd_stream (
-        .clock        (clock),
-        .reset        (reset),
-        .cmd_valid    (cmd_valid),
-        .cmd_inst     (cmd_inst),
-        .cmd_ready    (cmd_ready),
-        .cmd_done     (cmd_done),
-        .cmd_error    (cmd_error),
-        .core_busy    (busy),
-        .allow_finish (finish),
-        .command_active (command_active),
-        .done         (done),
-        .error        (error)
+    bnn_sim_cmd_stream #(
+        .C_S_AXI_ADDR_WIDTH (C_S_AXI_CONTROL_ADDR_WIDTH),
+        .C_S_AXI_DATA_WIDTH (C_S_AXI_CONTROL_DATA_WIDTH)
+    ) u_cmd_stream (
+        .clock                 (clock),
+        .reset                 (reset),
+        .soc_busy              (busy),
+        .allow_finish          (finish),
+        .mmio_active           (command_active),
+        .done                  (done),
+        .s_axi_control_AWVALID (s_axi_control_AWVALID),
+        .s_axi_control_AWREADY (s_axi_control_AWREADY),
+        .s_axi_control_AWADDR  (s_axi_control_AWADDR),
+        .s_axi_control_WVALID  (s_axi_control_WVALID),
+        .s_axi_control_WREADY  (s_axi_control_WREADY),
+        .s_axi_control_WDATA   (s_axi_control_WDATA),
+        .s_axi_control_WSTRB   (s_axi_control_WSTRB),
+        .s_axi_control_BVALID  (s_axi_control_BVALID),
+        .s_axi_control_BREADY  (s_axi_control_BREADY),
+        .s_axi_control_BRESP   (s_axi_control_BRESP),
+        .s_axi_control_ARVALID (s_axi_control_ARVALID),
+        .s_axi_control_ARREADY (s_axi_control_ARREADY),
+        .s_axi_control_ARADDR  (s_axi_control_ARADDR),
+        .s_axi_control_RVALID  (s_axi_control_RVALID),
+        .s_axi_control_RREADY  (s_axi_control_RREADY),
+        .s_axi_control_RDATA   (s_axi_control_RDATA),
+        .s_axi_control_RRESP   (s_axi_control_RRESP)
     );
 
-    bnn_core_top #(
-        .ADDR_WIDTH     (32),
-        .DMA_DATA_WIDTH (DMA_DATA_WIDTH),
-        .DMA_LEN_WIDTH  (DMA_LEN_WIDTH)
-    ) u_core (
-        .clock               (clock),
-        .reset               (reset),
-        .cmd_valid           (cmd_valid),
-        .cmd_inst            (cmd_inst),
-        .cmd_ready           (cmd_ready),
-        .cmd_done            (cmd_done),
-        .cmd_error           (cmd_error),
-        .status_busy         (status_busy),
-        .mem_rd_cmd_valid    (mem_rd_cmd_valid),
-        .mem_rd_cmd_ready    (mem_rd_cmd_ready),
-        .mem_rd_cmd_addr     (mem_rd_cmd_addr),
-        .mem_rd_cmd_len      (mem_rd_cmd_len),
-        .mem_rd_data_valid   (mem_rd_data_valid),
-        .mem_rd_data_ready   (mem_rd_data_ready),
-        .mem_rd_data         (mem_rd_data),
-        .mem_rd_data_last    (mem_rd_data_last),
-        .mem_wr_cmd_valid    (mem_wr_cmd_valid),
-        .mem_wr_cmd_ready    (mem_wr_cmd_ready),
-        .mem_wr_cmd_addr     (mem_wr_cmd_addr),
-        .mem_wr_cmd_len      (mem_wr_cmd_len),
-        .mem_wr_data_valid   (mem_wr_data_valid),
-        .mem_wr_data_ready   (mem_wr_data_ready),
-        .mem_wr_data         (mem_wr_data),
-        .mem_wr_data_strb    (mem_wr_data_strb),
-        .mem_wr_data_last    (mem_wr_data_last),
-        .mem_wr_done         (mem_wr_done)
+    bnn_soc_top #(
+        .C_S_AXI_CONTROL_ADDR_WIDTH (C_S_AXI_CONTROL_ADDR_WIDTH),
+        .C_S_AXI_CONTROL_DATA_WIDTH (C_S_AXI_CONTROL_DATA_WIDTH),
+        .C_M_AXI_GMEM_ID_WIDTH      (C_M_AXI_GMEM_ID_WIDTH),
+        .C_M_AXI_GMEM_ADDR_WIDTH    (C_M_AXI_GMEM_ADDR_WIDTH),
+        .C_M_AXI_GMEM_DATA_WIDTH    (C_M_AXI_GMEM_DATA_WIDTH)
+    ) u_soc (
+        .ap_clk                (clock),
+        .ap_rst_n              (~reset),
+        .irq                   (irq),
+        .m_axi_gmem_AWVALID    (m_axi_gmem_AWVALID),
+        .m_axi_gmem_AWREADY    (m_axi_gmem_AWREADY),
+        .m_axi_gmem_AWADDR     (m_axi_gmem_AWADDR),
+        .m_axi_gmem_AWID       (m_axi_gmem_AWID),
+        .m_axi_gmem_AWUSER     (m_axi_gmem_AWUSER),
+        .m_axi_gmem_AWLEN      (m_axi_gmem_AWLEN),
+        .m_axi_gmem_AWSIZE     (m_axi_gmem_AWSIZE),
+        .m_axi_gmem_AWBURST    (m_axi_gmem_AWBURST),
+        .m_axi_gmem_AWLOCK     (m_axi_gmem_AWLOCK),
+        .m_axi_gmem_AWCACHE    (m_axi_gmem_AWCACHE),
+        .m_axi_gmem_AWPROT     (m_axi_gmem_AWPROT),
+        .m_axi_gmem_AWQOS      (m_axi_gmem_AWQOS),
+        .m_axi_gmem_AWREGION   (m_axi_gmem_AWREGION),
+        .m_axi_gmem_WVALID     (m_axi_gmem_WVALID),
+        .m_axi_gmem_WREADY     (m_axi_gmem_WREADY),
+        .m_axi_gmem_WDATA      (m_axi_gmem_WDATA),
+        .m_axi_gmem_WSTRB      (m_axi_gmem_WSTRB),
+        .m_axi_gmem_WLAST      (m_axi_gmem_WLAST),
+        .m_axi_gmem_WID        (m_axi_gmem_WID),
+        .m_axi_gmem_WUSER      (m_axi_gmem_WUSER),
+        .m_axi_gmem_BVALID     (m_axi_gmem_BVALID),
+        .m_axi_gmem_BREADY     (m_axi_gmem_BREADY),
+        .m_axi_gmem_BRESP      (m_axi_gmem_BRESP),
+        .m_axi_gmem_BID        (m_axi_gmem_BID),
+        .m_axi_gmem_BUSER      (m_axi_gmem_BUSER),
+        .m_axi_gmem_ARVALID    (m_axi_gmem_ARVALID),
+        .m_axi_gmem_ARREADY    (m_axi_gmem_ARREADY),
+        .m_axi_gmem_ARADDR     (m_axi_gmem_ARADDR),
+        .m_axi_gmem_ARID       (m_axi_gmem_ARID),
+        .m_axi_gmem_ARUSER     (m_axi_gmem_ARUSER),
+        .m_axi_gmem_ARLEN      (m_axi_gmem_ARLEN),
+        .m_axi_gmem_ARSIZE     (m_axi_gmem_ARSIZE),
+        .m_axi_gmem_ARBURST    (m_axi_gmem_ARBURST),
+        .m_axi_gmem_ARLOCK     (m_axi_gmem_ARLOCK),
+        .m_axi_gmem_ARCACHE    (m_axi_gmem_ARCACHE),
+        .m_axi_gmem_ARPROT     (m_axi_gmem_ARPROT),
+        .m_axi_gmem_ARQOS      (m_axi_gmem_ARQOS),
+        .m_axi_gmem_ARREGION   (m_axi_gmem_ARREGION),
+        .m_axi_gmem_RVALID     (m_axi_gmem_RVALID),
+        .m_axi_gmem_RREADY     (m_axi_gmem_RREADY),
+        .m_axi_gmem_RDATA      (m_axi_gmem_RDATA),
+        .m_axi_gmem_RRESP      (m_axi_gmem_RRESP),
+        .m_axi_gmem_RLAST      (m_axi_gmem_RLAST),
+        .m_axi_gmem_RID        (m_axi_gmem_RID),
+        .m_axi_gmem_RUSER      (m_axi_gmem_RUSER),
+        .s_axi_control_AWVALID (s_axi_control_AWVALID),
+        .s_axi_control_AWREADY (s_axi_control_AWREADY),
+        .s_axi_control_AWADDR  (s_axi_control_AWADDR),
+        .s_axi_control_WVALID  (s_axi_control_WVALID),
+        .s_axi_control_WREADY  (s_axi_control_WREADY),
+        .s_axi_control_WDATA   (s_axi_control_WDATA),
+        .s_axi_control_WSTRB   (s_axi_control_WSTRB),
+        .s_axi_control_BVALID  (s_axi_control_BVALID),
+        .s_axi_control_BREADY  (s_axi_control_BREADY),
+        .s_axi_control_BRESP   (s_axi_control_BRESP),
+        .s_axi_control_ARVALID (s_axi_control_ARVALID),
+        .s_axi_control_ARREADY (s_axi_control_ARREADY),
+        .s_axi_control_ARADDR  (s_axi_control_ARADDR),
+        .s_axi_control_RVALID  (s_axi_control_RVALID),
+        .s_axi_control_RREADY  (s_axi_control_RREADY),
+        .s_axi_control_RDATA   (s_axi_control_RDATA),
+        .s_axi_control_RRESP   (s_axi_control_RRESP)
     );
 
     bnn_sim_data_memory #(
-        .ADDR_WIDTH     (32),
-        .DMA_DATA_WIDTH (DMA_DATA_WIDTH),
-        .DMA_LEN_WIDTH  (DMA_LEN_WIDTH)
+        .C_M_AXI_ID_WIDTH   (C_M_AXI_GMEM_ID_WIDTH),
+        .C_M_AXI_ADDR_WIDTH (C_M_AXI_GMEM_ADDR_WIDTH),
+        .C_M_AXI_DATA_WIDTH (C_M_AXI_GMEM_DATA_WIDTH)
     ) u_data_memory (
-        .clock          (clock),
-        .reset          (reset),
-        .rd_cmd_valid   (mem_rd_cmd_valid),
-        .rd_cmd_ready   (mem_rd_cmd_ready),
-        .rd_cmd_addr    (mem_rd_cmd_addr),
-        .rd_cmd_len     (mem_rd_cmd_len),
-        .rd_data_valid  (mem_rd_data_valid),
-        .rd_data_ready  (mem_rd_data_ready),
-        .rd_data        (mem_rd_data),
-        .rd_data_last   (mem_rd_data_last),
-        .wr_cmd_valid   (mem_wr_cmd_valid),
-        .wr_cmd_ready   (mem_wr_cmd_ready),
-        .wr_cmd_addr    (mem_wr_cmd_addr),
-        .wr_cmd_len     (mem_wr_cmd_len),
-        .wr_data_valid  (mem_wr_data_valid),
-        .wr_data_ready  (mem_wr_data_ready),
-        .wr_data        (mem_wr_data),
-        .wr_data_strb   (mem_wr_data_strb),
-        .wr_data_last   (mem_wr_data_last),
-        .wr_done        (mem_wr_done),
-        .rd_busy        (rd_busy),
-        .wr_busy        (wr_busy)
+        .clock              (clock),
+        .reset              (reset),
+        .m_axi_gmem_AWVALID (m_axi_gmem_AWVALID),
+        .m_axi_gmem_AWREADY (m_axi_gmem_AWREADY),
+        .m_axi_gmem_AWADDR  (m_axi_gmem_AWADDR),
+        .m_axi_gmem_AWID    (m_axi_gmem_AWID),
+        .m_axi_gmem_AWUSER  (m_axi_gmem_AWUSER),
+        .m_axi_gmem_AWLEN   (m_axi_gmem_AWLEN),
+        .m_axi_gmem_AWSIZE  (m_axi_gmem_AWSIZE),
+        .m_axi_gmem_AWBURST (m_axi_gmem_AWBURST),
+        .m_axi_gmem_AWLOCK  (m_axi_gmem_AWLOCK),
+        .m_axi_gmem_AWCACHE (m_axi_gmem_AWCACHE),
+        .m_axi_gmem_AWPROT  (m_axi_gmem_AWPROT),
+        .m_axi_gmem_AWQOS   (m_axi_gmem_AWQOS),
+        .m_axi_gmem_AWREGION(m_axi_gmem_AWREGION),
+        .m_axi_gmem_WVALID  (m_axi_gmem_WVALID),
+        .m_axi_gmem_WREADY  (m_axi_gmem_WREADY),
+        .m_axi_gmem_WDATA   (m_axi_gmem_WDATA),
+        .m_axi_gmem_WSTRB   (m_axi_gmem_WSTRB),
+        .m_axi_gmem_WLAST   (m_axi_gmem_WLAST),
+        .m_axi_gmem_WID     (m_axi_gmem_WID),
+        .m_axi_gmem_WUSER   (m_axi_gmem_WUSER),
+        .m_axi_gmem_BVALID  (m_axi_gmem_BVALID),
+        .m_axi_gmem_BREADY  (m_axi_gmem_BREADY),
+        .m_axi_gmem_BRESP   (m_axi_gmem_BRESP),
+        .m_axi_gmem_BID     (m_axi_gmem_BID),
+        .m_axi_gmem_BUSER   (m_axi_gmem_BUSER),
+        .m_axi_gmem_ARVALID (m_axi_gmem_ARVALID),
+        .m_axi_gmem_ARREADY (m_axi_gmem_ARREADY),
+        .m_axi_gmem_ARADDR  (m_axi_gmem_ARADDR),
+        .m_axi_gmem_ARID    (m_axi_gmem_ARID),
+        .m_axi_gmem_ARUSER  (m_axi_gmem_ARUSER),
+        .m_axi_gmem_ARLEN   (m_axi_gmem_ARLEN),
+        .m_axi_gmem_ARSIZE  (m_axi_gmem_ARSIZE),
+        .m_axi_gmem_ARBURST (m_axi_gmem_ARBURST),
+        .m_axi_gmem_ARLOCK  (m_axi_gmem_ARLOCK),
+        .m_axi_gmem_ARCACHE (m_axi_gmem_ARCACHE),
+        .m_axi_gmem_ARPROT  (m_axi_gmem_ARPROT),
+        .m_axi_gmem_ARQOS   (m_axi_gmem_ARQOS),
+        .m_axi_gmem_ARREGION(m_axi_gmem_ARREGION),
+        .m_axi_gmem_RVALID  (m_axi_gmem_RVALID),
+        .m_axi_gmem_RREADY  (m_axi_gmem_RREADY),
+        .m_axi_gmem_RDATA   (m_axi_gmem_RDATA),
+        .m_axi_gmem_RRESP   (m_axi_gmem_RRESP),
+        .m_axi_gmem_RLAST   (m_axi_gmem_RLAST),
+        .m_axi_gmem_RID     (m_axi_gmem_RID),
+        .m_axi_gmem_RUSER   (m_axi_gmem_RUSER),
+        .rd_busy            (rd_busy),
+        .wr_busy            (wr_busy)
     );
 
     always @(posedge clock) begin

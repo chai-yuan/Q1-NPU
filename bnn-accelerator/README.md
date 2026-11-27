@@ -105,9 +105,11 @@ make ACCE=remote
 ./bnn-infer-v2 llm qwen3-zh-5k.gguf --ids ids.txt --steps 1 --ctx 8
 ```
 
-该后端以 RTL 为数值基准：F32 运算走硬件按 128 tile 的动态量化，I8 走 INT8 直通。
-后端负责按 (out tile, K tile) 打包 18 字节权重、生成 LOAD/COMPUTE/WRITEBACK
-指令序列，并在执行期间应答仿真器的 DMA 突发读预取与 8 字节内存读写。
+该后端以 `bnn_soc_top` RTL 为数值基准：通过 32-bit MMIO 寄存器读写（校验 `CORE_ID`、写
+`CMD_LO / CMD_HI / CTRL_STATUS.LAUNCH` 并轮询 `DONE`）驱动硬件，F32 运算走硬件按 128 tile
+的动态量化，I8 走 INT8 直通。后端负责按 (out tile, K tile) 打包 18 字节权重、下发
+LOAD/COMPUTE/WRITEBACK 指令序列，并在轮询等待期间应答仿真器 64-bit AXI4 主接口的突发读预取与
+8 字节内存读写。
 `BNN_REMOTE_ADDR`（默认 `127.0.0.1:12345`）和 `BNN_REMOTE_MEM_BYTES`
 （默认 512 MiB）分别配置连接地址和设备内存大小。
 

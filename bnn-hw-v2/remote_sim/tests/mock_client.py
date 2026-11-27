@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Minimal TCP client for bnn-hw-v2/remote_sim.
+"""Minimal SoC MMIO TCP client for bnn-hw-v2/remote_sim.
 
-Plays the role of the upper software stack: sends the committed Qwen3 command
-stream one instruction at a time, serves the simulator's memory reads/writes,
-and writes the final memory image for comparison with simple_test.
+Drives bnn_soc_top exactly like an ARM host processor on Zynq: verifies CORE_ID,
+configures DATA_BASE, writes 64-bit instructions via CMD_LO / CMD_HI, triggers
+CTRL_STATUS.LAUNCH, and polls CTRL_STATUS.DONE while serving the simulator's
+64-bit AXI4 DMA memory traffic.
 
 Wire format (little-endian, 16-byte header + payload):
     magic  u32 = 0x424E4E53 ("BNNS")
@@ -12,11 +13,6 @@ Wire format (little-endian, 16-byte header + payload):
     seq    u16
     addr   u32
     length u32
-
-READ requests always fetch 8 bytes and carry no payload; READ responses carry
-8 bytes. READ_BURST requests carry a 4-byte byte count and are answered with
-the whole data payload. WRITE messages carry 8 bytes with the byte strobe in
-flags.
 """
 
 import argparse
@@ -30,15 +26,34 @@ import time
 MAGIC = 0x424E4E53
 HEADER = struct.Struct("<IBBHII")
 
-TYPE_CMD = 0x01
 TYPE_READ = 0x02
 TYPE_WRITE = 0x03
 TYPE_QUIT = 0x04
 TYPE_READ_BURST = 0x05
+TYPE_MMIO_WRITE = 0x10
+TYPE_MMIO_READ = 0x11
 TYPE_READ_RSP = 0x81
-TYPE_CMD_DONE = 0x82
 TYPE_QUIT_ACK = 0x83
 TYPE_READ_BURST_RSP = 0x85
+TYPE_MMIO_WRITE_RSP = 0x90
+TYPE_MMIO_READ_RSP = 0x91
+
+# bnn_soc_ctrl MMIO register map
+REG_CTRL_STATUS = 0x00
+REG_CYCLE_CNT = 0x04
+REG_CMD_LO = 0x08
+REG_CMD_HI = 0x0C
+REG_DATA_BASE_LO = 0x10
+REG_DATA_BASE_HI = 0x14
+REG_CMD_DONE_CNT = 0x18
+REG_ERR_CODE = 0x1C
+REG_CORE_ID = 0x20
+
+CORE_MAGIC_ID = 0x424E4E32  # "BNN2"
+CTRL_LAUNCH = 1 << 0
+CTRL_DONE = 1 << 1
+CTRL_ERROR = 1 << 3
+CTRL_SOFT_RESET = 1 << 4
 
 
 class ProtocolError(RuntimeError):
@@ -138,78 +153,158 @@ def connect(port, timeout=10.0):
             time.sleep(0.05)
 
 
-def apply_write(memory, message, highest):
+def apply_write(memory, message, data_base, highest):
     address = message["addr"]
+    if address < data_base:
+        raise ProtocolError(f"write below data_base at 0x{address:x}")
+    offset = address - data_base
     payload = message["payload"]
-    if address + len(payload) > len(memory):
+    if offset + len(payload) > len(memory):
         raise ProtocolError(f"write beyond memory at 0x{address:x}")
     for index, value in enumerate(payload):
         if message["flags"] & (1 << index):
-            memory[address + index] = value
-    return max(highest, address + len(payload))
+            memory[offset + index] = value
+    return max(highest, offset + len(payload))
 
 
-def serve_message(sock, memory, message, highest):
+def serve_memory_message(sock, memory, data_base, message, highest):
     if message["type"] == TYPE_READ:
         address = message["addr"]
-        # READ requests always fetch 8 bytes; the header carries no payload.
+        if address < data_base:
+            raise ProtocolError(f"read below data_base at 0x{address:x}")
+        offset = address - data_base
         length = 8
-        if address + length > len(memory):
+        if offset + length > len(memory):
             raise ProtocolError(f"read beyond memory at 0x{address:x}")
         send_message(
             sock,
             TYPE_READ_RSP,
             seq=message["seq"],
             addr=address,
-            payload=bytes(memory[address : address + length]),
+            payload=bytes(memory[offset : offset + length]),
         )
         return highest
     if message["type"] == TYPE_READ_BURST:
         if len(message["payload"]) != 4:
             raise ProtocolError("burst read request without a byte count")
         address = message["addr"]
+        if address < data_base:
+            raise ProtocolError(f"burst read below data_base at 0x{address:x}")
+        offset = address - data_base
         length = struct.unpack("<I", message["payload"])[0]
-        if length == 0 or address + length > len(memory):
+        if length == 0 or offset + length > len(memory):
             raise ProtocolError(f"burst read beyond memory at 0x{address:x}")
         send_message(
             sock,
             TYPE_READ_BURST_RSP,
             seq=message["seq"],
             addr=address,
-            payload=bytes(memory[address : address + length]),
+            payload=bytes(memory[offset : offset + length]),
         )
         return highest
     if message["type"] == TYPE_WRITE:
-        return apply_write(memory, message, highest)
+        return apply_write(memory, message, data_base, highest)
     raise ProtocolError(f"unexpected message type 0x{message['type']:02x}")
 
 
-def run(sock, commands, memory):
-    """Send commands one at a time, serving simulator memory traffic."""
-    highest = 0
-    for index, inst in enumerate(commands):
+class MmioSession:
+    def __init__(self, sock, memory, data_base=0):
+        self.sock = sock
+        self.memory = memory
+        self.data_base = data_base
+        self.highest = 0
+        self.seq = 0
+
+    def next_seq(self):
+        self.seq = (self.seq + 1) & 0xFFFF
+        return self.seq
+
+    def write32(self, offset, value, wstrb=0xF):
+        seq = self.next_seq()
         send_message(
-            sock, TYPE_CMD, seq=index & 0xFFFF, payload=struct.pack("<Q", inst)
+            self.sock,
+            TYPE_MMIO_WRITE,
+            seq=seq,
+            addr=offset,
+            flags=wstrb & 0xF,
+            payload=struct.pack("<I", value & 0xFFFFFFFF),
         )
         while True:
-            message = recv_message(sock)
-            if message["type"] == TYPE_CMD_DONE:
-                if message["seq"] != (index & 0xFFFF):
-                    raise ProtocolError(
-                        f"command {index}: completion seq {message['seq']}"
-                    )
-                if message["flags"] & 1:
-                    raise ProtocolError(f"command {index}: simulator reported cmd_error")
-                break
-            highest = serve_message(sock, memory, message, highest)
+            msg = recv_message(self.sock)
+            if msg["type"] == TYPE_MMIO_WRITE_RSP:
+                if msg["seq"] != seq:
+                    raise ProtocolError(f"MMIO write seq mismatch: {msg['seq']} != {seq}")
+                if msg["flags"] != 0:
+                    raise ProtocolError(f"MMIO write BRESP error: {msg['flags']}")
+                return
+            self.highest = serve_memory_message(
+                self.sock, self.memory, self.data_base, msg, self.highest
+            )
 
-    send_message(sock, TYPE_QUIT)
-    while True:
-        message = recv_message(sock)
-        if message["type"] == TYPE_QUIT_ACK:
-            break
-        highest = serve_message(sock, memory, message, highest)
-    return highest
+    def read32(self, offset):
+        seq = self.next_seq()
+        send_message(self.sock, TYPE_MMIO_READ, seq=seq, addr=offset)
+        while True:
+            msg = recv_message(self.sock)
+            if msg["type"] == TYPE_MMIO_READ_RSP:
+                if msg["seq"] != seq:
+                    raise ProtocolError(f"MMIO read seq mismatch: {msg['seq']} != {seq}")
+                if msg["flags"] != 0:
+                    raise ProtocolError(f"MMIO read RRESP error: {msg['flags']}")
+                if len(msg["payload"]) != 4:
+                    raise ProtocolError("MMIO read response missing 4-byte payload")
+                return struct.unpack("<I", msg["payload"])[0]
+            self.highest = serve_memory_message(
+                self.sock, self.memory, self.data_base, msg, self.highest
+            )
+
+    def quit(self):
+        send_message(self.sock, TYPE_QUIT)
+        while True:
+            msg = recv_message(self.sock)
+            if msg["type"] == TYPE_QUIT_ACK:
+                return
+            self.highest = serve_memory_message(
+                self.sock, self.memory, self.data_base, msg, self.highest
+            )
+
+
+def run(sock, commands, memory, data_base=0):
+    """Drive bnn_soc_top via AXI4-Lite MMIO registers and verify completion."""
+    session = MmioSession(sock, memory, data_base=data_base)
+
+    core_id = session.read32(REG_CORE_ID)
+    if core_id != CORE_MAGIC_ID:
+        raise ProtocolError(f"unexpected CORE_ID 0x{core_id:08x}")
+
+    session.write32(REG_CTRL_STATUS, CTRL_SOFT_RESET)
+    session.write32(REG_DATA_BASE_LO, data_base & 0xFFFFFFFF)
+    session.write32(REG_DATA_BASE_HI, (data_base >> 32) & 0xFFFFFFFF)
+
+    for index, inst in enumerate(commands):
+        session.write32(REG_CMD_LO, inst & 0xFFFFFFFF)
+        session.write32(REG_CMD_HI, (inst >> 32) & 0xFFFFFFFF)
+        session.write32(REG_CTRL_STATUS, CTRL_LAUNCH)
+        while True:
+            status = session.read32(REG_CTRL_STATUS)
+            if status & CTRL_ERROR:
+                err_code = session.read32(REG_ERR_CODE)
+                raise ProtocolError(
+                    f"command {index}: SoC reported ERROR (ERR_CODE=0x{err_code:x})"
+                )
+            if status & CTRL_DONE:
+                break
+
+    done_cnt = session.read32(REG_CMD_DONE_CNT)
+    if done_cnt != len(commands):
+        raise ProtocolError(
+            f"CMD_DONE_CNT mismatch: got {done_cnt}, expected {len(commands)}"
+        )
+    hw_cycles = session.read32(REG_CYCLE_CNT)
+    print(f"soc_ctrl: CORE_ID=0x{core_id:08x}, CMD_DONE_CNT={done_cnt}, CYCLE_CNT={hw_cycles}")
+
+    session.quit()
+    return session.highest
 
 
 def main():
@@ -220,6 +315,12 @@ def main():
     parser.add_argument("--memory", required=True, help="initial memory image")
     parser.add_argument("--output", required=True, help="output memory image")
     parser.add_argument("--reference", help="optional reference memory image")
+    parser.add_argument(
+        "--data-base",
+        type=lambda s: int(s, 0),
+        default=0,
+        help="optional physical DATA_BASE offset (e.g. 0x10000ff0)",
+    )
     args = parser.parse_args()
 
     commands = parse_commands(args.commands)
@@ -230,7 +331,7 @@ def main():
     try:
         sock = connect(port)
         with sock:
-            highest = run(sock, commands, memory)
+            highest = run(sock, commands, memory, data_base=args.data_base)
         server.wait(timeout=30)
         output = server.stdout.read()
         if output.strip():

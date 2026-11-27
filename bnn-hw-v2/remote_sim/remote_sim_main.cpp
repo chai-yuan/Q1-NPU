@@ -1,8 +1,9 @@
 // BNN v2 remote co-simulation: Verilator + DPI-C over a local TCP socket.
 //
-// The upper software stack connects as a TCP client. The simulation sends
-// memory read/write requests and command-completion replies; the client sends
-// 64-bit commands, read responses and a quit request.
+// Exposes the Zynq SoC wrapper (bnn_soc_top) to the upper software stack as a
+// real memory-mapped peripheral: the client performs 32-bit AXI4-Lite register
+// reads/writes (s_axi_control_*) and serves 64-bit AXI4 DMA memory traffic
+// (m_axi_gmem_*).
 //
 // Message framing (little-endian, 16-byte header + payload):
 //   magic  u32  = 0x424E4E53 ("BNNS")
@@ -13,19 +14,22 @@
 //   length u32   payload bytes following the header
 //
 // Types:
-//   0x01 CMD            client -> sim   payload = 8-byte instruction
-//   0x02 READ           sim -> client   addr; always reads 8 bytes, no payload
-//   0x03 WRITE          sim -> client   flags = byte strobe, payload = 8 bytes
-//   0x04 QUIT           client -> sim
-//   0x05 READ_BURST     sim -> client   addr; payload = 4-byte byte count
-//   0x81 READ_RSP       client -> sim   seq/addr echo, payload = 8 bytes
-//   0x82 CMD_DONE       sim -> client   seq echo, flags bit0 = error
-//   0x83 QUIT_ACK       sim -> client
-//   0x85 READ_BURST_RSP client -> sim   seq/addr echo, payload = data
+//   0x02 READ            sim -> client   addr; always reads 8 bytes, no payload
+//   0x03 WRITE           sim -> client   flags = byte strobe, payload = 8 bytes
+//   0x04 QUIT            client -> sim
+//   0x05 READ_BURST      sim -> client   addr; payload = 4-byte byte count
+//   0x10 MMIO_WRITE      client -> sim   addr = reg offset, flags = 4b wstrb, payload = 4B
+//   0x11 MMIO_READ       client -> sim   addr = reg offset, no payload
+//   0x81 READ_RSP        client -> sim   seq/addr echo, payload = 8 bytes
+//   0x83 QUIT_ACK        sim -> client
+//   0x85 READ_BURST_RSP  client -> sim   seq/addr echo, payload = data
+//   0x90 MMIO_WRITE_RSP  sim -> client   seq echo, flags = 2b BRESP
+//   0x91 MMIO_READ_RSP   sim -> client   seq echo, flags = 2b RRESP, payload = 4B
 //
-// Commands are issued one at a time: the client waits for CMD_DONE before
-// sending the next CMD. Reads are synchronous; writes are fire-and-forget and
-// ordered by TCP.
+// While bnn_soc_top is busy executing a command, incoming MMIO requests (such
+// as status-polling reads) are paced by --mmio-poll-cycles (default 128 cycles,
+// or released immediately as soon as the hardware goes idle) so the client can
+// run standard polling loops without flooding the local socket.
 //
 // The DMA read path prefetches a whole burst with READ_BURST at the read
 // command handshake, so the per-word READ path normally hits a local cache.
@@ -65,15 +69,17 @@
 namespace {
 
 constexpr std::uint32_t kMagic = 0x424E4E53u;
-constexpr std::uint8_t kTypeCmd = 0x01;
 constexpr std::uint8_t kTypeRead = 0x02;
 constexpr std::uint8_t kTypeWrite = 0x03;
 constexpr std::uint8_t kTypeQuit = 0x04;
 constexpr std::uint8_t kTypeReadBurst = 0x05;
+constexpr std::uint8_t kTypeMmioWrite = 0x10;
+constexpr std::uint8_t kTypeMmioRead = 0x11;
 constexpr std::uint8_t kTypeReadRsp = 0x81;
-constexpr std::uint8_t kTypeCmdDone = 0x82;
 constexpr std::uint8_t kTypeQuitAck = 0x83;
 constexpr std::uint8_t kTypeReadBurstRsp = 0x85;
+constexpr std::uint8_t kTypeMmioWriteRsp = 0x90;
+constexpr std::uint8_t kTypeMmioReadRsp = 0x91;
 constexpr std::size_t kHeaderBytes = 16;
 constexpr std::uint32_t kMaxPayload = 1u << 20;
 constexpr std::uint64_t kCycleLimit = 1'000'000'000ull;
@@ -158,9 +164,12 @@ bool recv_message(int fd, Message& message) {
     return length == 0 || read_exact(fd, message.payload.data(), length);
 }
 
-struct PendingCommand {
-    std::uint16_t seq;
-    std::uint64_t inst;
+struct PendingMmio {
+    std::uint16_t seq = 0;
+    std::uint16_t addr = 0;
+    std::uint32_t wdata = 0;
+    std::uint8_t wstrb = 0;
+    bool is_write = false;
 };
 
 class RemoteServer {
@@ -174,27 +183,23 @@ public:
     RemoteServer(const RemoteServer&) = delete;
     RemoteServer& operator=(const RemoteServer&) = delete;
 
-    bool has_command() {
-        std::lock_guard<std::mutex> lock(command_mutex_);
-        return !commands_.empty();
+    bool has_mmio() {
+        std::lock_guard<std::mutex> lock(mmio_mutex_);
+        return !mmio_queue_.empty();
     }
 
-    std::uint64_t pop_command() {
-        PendingCommand command{};
+    PendingMmio pop_mmio() {
+        PendingMmio req{};
         {
-            std::lock_guard<std::mutex> lock(command_mutex_);
-            if (commands_.empty()) {
+            std::lock_guard<std::mutex> lock(mmio_mutex_);
+            if (mmio_queue_.empty()) {
                 protocol_error_ = true;
-                return 0;
+                return req;
             }
-            command = commands_.front();
-            commands_.pop_front();
+            req = mmio_queue_.front();
+            mmio_queue_.pop_front();
         }
-        {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            inflight_.push_back(command.seq);
-        }
-        return command.inst;
+        return req;
     }
 
     std::uint64_t read_memory(std::uint64_t address) {
@@ -235,18 +240,15 @@ public:
         send(kTypeWrite, strobe, 0, static_cast<std::uint32_t>(address), payload);
     }
 
-    void send_cmd_done(bool error) {
-        std::uint16_t seq = 0;
-        {
-            std::lock_guard<std::mutex> lock(inflight_mutex_);
-            if (inflight_.empty()) {
-                protocol_error_ = true;
-                return;
-            }
-            seq = inflight_.front();
-            inflight_.pop_front();
+    void send_mmio_rsp(std::uint16_t seq, bool is_write, std::uint32_t rdata,
+                       std::uint8_t resp) {
+        if (is_write) {
+            send(kTypeMmioWriteRsp, resp & 0x3u, seq, 0, {});
+        } else {
+            std::vector<std::uint8_t> payload(4);
+            put_u32(payload.data(), rdata);
+            send(kTypeMmioReadRsp, resp & 0x3u, seq, 0, payload);
         }
-        send(kTypeCmdDone, error ? 1 : 0, seq, 0, {});
     }
 
     void send_quit_ack() { send(kTypeQuitAck, 0, 0, 0, {}); }
@@ -322,19 +324,35 @@ private:
                 break;
             }
             switch (message.type) {
-            case kTypeCmd: {
-                if (message.payload.size() != 8) {
+            case kTypeMmioWrite: {
+                if (message.payload.size() != 4) {
                     protocol_error_ = true;
                     break;
                 }
-                PendingCommand command{};
-                command.seq = message.seq;
-                command.inst = 0;
-                for (int byte = 0; byte < 8; ++byte)
-                    command.inst |= std::uint64_t{message.payload[byte]} << (8 * byte);
+                PendingMmio req{};
+                req.seq = message.seq;
+                req.addr = static_cast<std::uint16_t>(message.addr & 0xFFFFu);
+                req.wdata = get_u32(message.payload.data());
+                req.wstrb = static_cast<std::uint8_t>(message.flags & 0xFu);
+                req.is_write = true;
                 {
-                    std::lock_guard<std::mutex> lock(command_mutex_);
-                    commands_.push_back(command);
+                    std::lock_guard<std::mutex> lock(mmio_mutex_);
+                    mmio_queue_.push_back(req);
+                }
+                break;
+            }
+            case kTypeMmioRead: {
+                if (!message.payload.empty()) {
+                    protocol_error_ = true;
+                    break;
+                }
+                PendingMmio req{};
+                req.seq = message.seq;
+                req.addr = static_cast<std::uint16_t>(message.addr & 0xFFFFu);
+                req.is_write = false;
+                {
+                    std::lock_guard<std::mutex> lock(mmio_mutex_);
+                    mmio_queue_.push_back(req);
                 }
                 break;
             }
@@ -375,10 +393,8 @@ private:
     std::thread receiver_;
 
     std::mutex send_mutex_;
-    std::mutex command_mutex_;
-    std::deque<PendingCommand> commands_;
-    std::mutex inflight_mutex_;
-    std::deque<std::uint16_t> inflight_;
+    std::mutex mmio_mutex_;
+    std::deque<PendingMmio> mmio_queue_;
 
     std::mutex read_mutex_;
     std::condition_variable read_cv_;
@@ -590,57 +606,77 @@ private:
 // ---- internal RTL signal accessors ----
 // Verilator-flat names from build/Vbnn_sim_top___024root.h. These are
 // simulation-only and must be updated if the RTL hierarchy changes.
+int soc_ctrl_state(const ProbeContext& context) {
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__u_soc_ctrl__DOT__cmd_state;
+}
+
+int soc_dma_rd_state(const ProbeContext& context) {
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__u_soc_dma__DOT__rd_state;
+}
+
+int soc_dma_wr_state(const ProbeContext& context) {
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__u_soc_dma__DOT__wr_state;
+}
+
 int controller_state(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__u_top_controller__DOT__state;
+    return context.dut.rootp
+        ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_top_controller__DOT__state;
 }
 
 bool controller_input_int8(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__u_top_controller__DOT__input_int8 != 0;
+    return context.dut.rootp
+               ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_top_controller__DOT__input_int8 !=
+           0;
 }
 
 int weight_loader_state(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__u_weight_loader__DOT__state;
+    return context.dut.rootp
+        ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_weight_loader__DOT__state;
 }
 
 int iqbuf_state(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__u_input_quant_buffer__DOT__state;
+    return context.dut.rootp
+        ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_input_quant_buffer__DOT__state;
 }
 
 int array_state(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__u_core_array__DOT__state;
+    return context.dut.rootp
+        ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_core_array__DOT__state;
 }
 
 int unit_state(const ProbeContext& context) {
     return context.dut.rootp
-        ->bnn_sim_top__DOT__u_core__DOT__u_core_array__DOT__g_unit__BRA__0__KET____DOT__u_unit__DOT__state;
+        ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_core_array__DOT__g_unit__BRA__0__KET____DOT__u_unit__DOT__state;
 }
 
 int output_accum_state(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__u_output_accum__DOT__state;
+    return context.dut.rootp
+        ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_output_accum__DOT__state;
 }
 
 int output_writer_state(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__u_output_writer__DOT__state;
+    return context.dut.rootp
+        ->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_output_writer__DOT__state;
 }
 
 bool core_idma_valid(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__idma_valid != 0;
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__idma_valid != 0;
 }
 
 bool core_idma_ready(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__idma_ready != 0;
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__idma_ready != 0;
 }
 
 bool core_odma_valid(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__odma_valid != 0;
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__odma_valid != 0;
 }
 
 bool core_odma_ready(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__u_core__DOT__odma_ready != 0;
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__odma_ready != 0;
 }
 
 bool mem_wr_data_ready(const ProbeContext& context) {
-    return context.dut.rootp->bnn_sim_top__DOT__mem_wr_data_ready != 0;
+    return context.dut.rootp->bnn_sim_top__DOT__u_soc__DOT__core_mem_wr_data_ready != 0;
 }
 
 // ---- FSM encodings (must match the RTL typedefs) ----
@@ -698,6 +734,15 @@ const char* const kOutputAccumStateNames[] = {
 const char* const kOutputWriterStateNames[] = {
     "IDLE", "COMMAND", "READ_REQUEST", "READ_RETURN", "SEND_DATA",
     "WAIT_RESPONSE", "ROW_COMPLETE",
+};
+const char* const kSocCtrlStateNames[] = {
+    "CMD_IDLE", "CMD_ISSUE", "CMD_WAIT", "CMD_DRAIN",
+};
+const char* const kSocDmaRdStateNames[] = {
+    "RD_IDLE", "RD_CALC", "RD_AR", "RD_DATA", "RD_DRAIN",
+};
+const char* const kSocDmaWrStateNames[] = {
+    "WR_IDLE", "WR_CALC", "WR_AW", "WR_DATA", "WR_RESP",
 };
 
 // ---- probe table: add or remove probes here ----
@@ -818,6 +863,9 @@ void register_probes(ProbeSet& probes) {
                });
 
     // FSM histograms.
+    probes.add_state("u_soc_ctrl", soc_ctrl_state, kSocCtrlStateNames);
+    probes.add_state("u_soc_dma_rd", soc_dma_rd_state, kSocDmaRdStateNames);
+    probes.add_state("u_soc_dma_wr", soc_dma_wr_state, kSocDmaWrStateNames);
     probes.add_state("u_top_controller", controller_state, kControllerStateNames);
     probes.add_state("u_weight_loader", weight_loader_state, kWeightLoaderStateNames);
     probes.add_state("u_input_quant_buffer", iqbuf_state, kIqbufStateNames);
@@ -864,12 +912,14 @@ std::uint16_t parse_port(const char* text) {
 }
 
 void print_usage(const char* program) {
-    std::fprintf(stderr,
-                 "usage: %s [--port N] [--no-probes] [--probe-interval N]\n"
-                 "  --port N             TCP port to listen on (default 12345)\n"
-                 "  --no-probes          disable cycle probes and the final report\n"
-                 "  --probe-interval N   print probe deltas every N cycles\n",
-                 program);
+    std::fprintf(
+        stderr,
+        "usage: %s [--port N] [--mmio-poll-cycles N] [--no-probes] [--probe-interval N]\n"
+        "  --port N             TCP port to listen on (default 12345)\n"
+        "  --mmio-poll-cycles N busy cycles between serviced MMIO polls (default 128)\n"
+        "  --no-probes          disable cycle probes and the final report\n"
+        "  --probe-interval N   print probe deltas every N cycles\n",
+        program);
 }
 
 std::uint64_t parse_positive(const char* text, const char* option) {
@@ -883,16 +933,46 @@ std::uint64_t parse_positive(const char* text, const char* option) {
     return static_cast<std::uint64_t>(value);
 }
 
+struct MmioBridgeState {
+    bool in_flight = false;
+    PendingMmio current{};
+    bool dut_busy = false;
+    std::uint64_t busy_cycles_since_mmio = 0;
+    std::uint64_t poll_interval = 128;
+};
+
+MmioBridgeState g_mmio;
+
 } // namespace
 
-extern "C" int cmd_check() {
-    return g_server != nullptr && g_server->has_command() ? 1 : 0;
+extern "C" int mmio_req_check() {
+    if (g_server == nullptr || g_mmio.in_flight || !g_server->has_mmio())
+        return 0;
+    if (g_mmio.dut_busy && g_mmio.busy_cycles_since_mmio < g_mmio.poll_interval)
+        return 0;
+    return 1;
 }
 
-extern "C" unsigned long long cmd_get() {
+extern "C" unsigned long long mmio_req_get() {
     if (g_server == nullptr)
         return 0;
-    return g_server->pop_command();
+    PendingMmio req = g_server->pop_mmio();
+    g_mmio.in_flight = true;
+    g_mmio.current = req;
+    g_mmio.busy_cycles_since_mmio = 0;
+    return (std::uint64_t{req.is_write ? 1u : 0u} << 56) |
+           (std::uint64_t{req.wstrb & 0xFu} << 48) |
+           (std::uint64_t{req.addr} << 32) |
+           std::uint64_t{req.wdata};
+}
+
+extern "C" void mmio_resp_put(int is_write, unsigned int rdata, unsigned int resp) {
+    if (g_server == nullptr || !g_mmio.in_flight)
+        return;
+    const PendingMmio completed = g_mmio.current;
+    g_mmio.in_flight = false;
+    g_server->send_mmio_rsp(completed.seq, is_write != 0, rdata,
+                            static_cast<std::uint8_t>(resp));
 }
 
 extern "C" unsigned long long data_read(unsigned long long address) {
@@ -917,6 +997,7 @@ int main(int argc, char** argv) {
     std::uint16_t port = 12345;
     bool probes_enabled = true;
     std::uint64_t probe_interval = 0;
+    std::uint64_t mmio_poll_cycles = 128;
     for (int i = 1; i < argc; ++i) {
         const std::string argument = argv[i];
         if (argument == "-h" || argument == "--help") {
@@ -928,6 +1009,13 @@ int main(int argc, char** argv) {
                 return 2;
             }
             port = parse_port(argv[i]);
+        } else if (argument == "--mmio-poll-cycles") {
+            if (++i >= argc) {
+                std::fprintf(stderr,
+                             "remote_sim: --mmio-poll-cycles requires a value\n");
+                return 2;
+            }
+            mmio_poll_cycles = parse_positive(argv[i], "--mmio-poll-cycles");
         } else if (argument == "--no-probes") {
             probes_enabled = false;
         } else if (argument == "--probe-interval") {
@@ -966,6 +1054,8 @@ int main(int argc, char** argv) {
 
     RemoteServer server(fd);
     g_server = &server;
+    g_mmio = MmioBridgeState{};
+    g_mmio.poll_interval = mmio_poll_cycles;
 
     VerilatedContext context;
     Vbnn_sim_top dut(&context);
@@ -984,20 +1074,19 @@ int main(int argc, char** argv) {
     std::uint64_t cycles = 0;
     std::uint64_t next_probe_report = probe_interval;
     std::uint64_t host_wait_ns = 0;
-    bool command_error = false;
     const auto wall_start = std::chrono::steady_clock::now();
     while (!context.gotFinish() && cycles < kCycleLimit) {
         if (server.failed())
             break;
 
-        // Do not advance simulation time while the core has no work. This
-        // keeps the cycle count independent of network and client latency.
+        // Do not advance simulation time while the SoC has no work and no MMIO
+        // request is pending. This keeps cycle counts independent of host/TCP jitter.
         const auto wait_start = std::chrono::steady_clock::now();
-        while (!dut.busy_out && !dut.command_active &&
-               !server.has_command() && !server.quit_requested()) {
+        while (!dut.busy_out && !dut.command_active && !g_mmio.in_flight &&
+               !server.has_mmio() && !server.quit_requested()) {
             if (server.failed())
                 break;
-            std::this_thread::sleep_for(std::chrono::microseconds(100));
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
         }
         host_wait_ns += static_cast<std::uint64_t>(
             std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -1006,7 +1095,16 @@ int main(int argc, char** argv) {
         if (server.failed())
             break;
 
-        dut.finish = server.quit_requested() ? 1 : 0;
+        g_mmio.dut_busy = dut.busy_out != 0;
+        if (g_mmio.dut_busy)
+            ++g_mmio.busy_cycles_since_mmio;
+        else
+            g_mmio.busy_cycles_since_mmio = 0;
+
+        dut.finish = (server.quit_requested() && !server.has_mmio() &&
+                      !g_mmio.in_flight)
+                         ? 1
+                         : 0;
         tick(dut);
         ++cycles;
 
@@ -1017,15 +1115,6 @@ int main(int argc, char** argv) {
                 next_probe_report += probe_interval;
             }
         }
-
-        if (dut.cmd_error_out) {
-            server.send_cmd_done(true);
-            std::fprintf(stderr, "remote_sim: core reported cmd_error\n");
-            command_error = true;
-            break;
-        }
-        if (dut.cmd_done_out)
-            server.send_cmd_done(false);
     }
     const auto wall_end = std::chrono::steady_clock::now();
 
@@ -1040,8 +1129,6 @@ int main(int argc, char** argv) {
         std::printf("remote_sim: finished after %llu cycles\n",
                     static_cast<unsigned long long>(cycles));
         status = 0;
-    } else if (command_error) {
-        status = 1;
     } else if (server.failed()) {
         std::fprintf(stderr, "remote_sim: connection or protocol failure\n");
     } else {

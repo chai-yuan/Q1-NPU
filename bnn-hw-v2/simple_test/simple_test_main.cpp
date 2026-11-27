@@ -26,6 +26,7 @@ constexpr std::uint64_t kCycleLimit = 10'000'000;
 std::vector<std::uint64_t> g_commands;
 std::size_t g_command_cursor = 0;
 std::vector<std::uint8_t> g_memory;
+std::uint64_t g_data_base = 0;
 std::uint64_t g_highest_write_end = 0;
 std::size_t g_initial_memory_size = 0;
 
@@ -598,7 +599,8 @@ public:
             active_dma_read_ = ActiveDmaRead{};
             active_dma_read_.active = true;
             active_dma_read_.start = cycle;
-            active_dma_read_.addr = *signals_.mem_rd_cmd_addr;
+            active_dma_read_.addr =
+                rd_select ? *signals_.iq_row_address : *signals_.wl_source_addr;
             active_dma_read_.len = static_cast<int>(*signals_.mem_rd_cmd_len);
             active_dma_read_.source = rd_select ? 1 : 0;
             active_dma_read_.last_beat = cycle;
@@ -903,7 +905,7 @@ private:
 
     void bind_signals() {
         Root* r = root_;
-#define P(field) (&r->bnn_sim_top__DOT__##field)
+#define P(field) (&r->bnn_sim_top__DOT__u_soc__DOT__##field)
         signals_.ctrl_state = P(u_core__DOT__u_top_controller__DOT__state);
         signals_.ctrl_done = P(u_core__DOT__u_top_controller__DOT__done_reg);
         signals_.ctrl_error = P(u_core__DOT__u_top_controller__DOT__error_reg);
@@ -934,7 +936,7 @@ private:
         signals_.arr_groups = P(u_core__DOT__u_core_array__DOT__groups);
         signals_.arr_group_index = P(u_core__DOT__u_core_array__DOT__group_index);
         signals_.arr_last_group = P(u_core__DOT__u_core_array__DOT__last_group);
-#define U(n) (&r->bnn_sim_top__DOT__u_core__DOT__u_core_array__DOT__g_unit__BRA__##n##__KET____DOT__u_unit__DOT__state)
+#define U(n) (&r->bnn_sim_top__DOT__u_soc__DOT__u_core__DOT__u_core_array__DOT__g_unit__BRA__##n##__KET____DOT__u_unit__DOT__state)
         signals_.unit_state[0] = U(0);
         signals_.unit_state[1] = U(1);
         signals_.unit_state[2] = U(2);
@@ -954,23 +956,22 @@ private:
         signals_.wr_row_addr = P(u_core__DOT__u_output_writer__DOT__row_addr);
         signals_.wr_last_beat = P(u_core__DOT__u_output_writer__DOT__last_beat);
 
-        signals_.cmd_stream_state = P(u_cmd_stream__DOT__state);
-        signals_.cmd_ready = P(cmd_ready);
-        signals_.cmd_inst = P(u_cmd_stream__DOT__inst);
+        signals_.cmd_stream_state = P(u_soc_ctrl__DOT__cmd_state);
+        signals_.cmd_ready = P(core_cmd_ready);
+        signals_.cmd_inst = P(u_soc_ctrl__DOT__cmd_latch);
 
         signals_.idma_valid = P(u_core__DOT__idma_valid);
         signals_.idma_ready = P(u_core__DOT__idma_ready);
         signals_.odma_valid = P(u_core__DOT__odma_valid);
         signals_.odma_ready = P(u_core__DOT__odma_ready);
-        signals_.mem_rd_cmd_addr = P(mem_rd_cmd_addr);
-        signals_.mem_rd_cmd_len = P(mem_rd_cmd_len);
-        signals_.mem_rd_cmd_ready = P(mem_rd_cmd_ready);
-        signals_.mem_rd_data_valid = P(mem_rd_data_valid);
-        signals_.mem_rd_data_last = P(mem_rd_data_last);
-        signals_.mem_wr_cmd_ready = P(mem_wr_cmd_ready);
-        signals_.mem_wr_data_valid = P(mem_wr_data_valid);
-        signals_.mem_wr_data_ready = P(mem_wr_data_ready);
-        signals_.mem_wr_done = P(mem_wr_done);
+        signals_.mem_rd_cmd_len = P(core_mem_rd_cmd_len);
+        signals_.mem_rd_cmd_ready = P(core_mem_rd_cmd_ready);
+        signals_.mem_rd_data_valid = P(core_mem_rd_data_valid);
+        signals_.mem_rd_data_last = P(u_soc_dma__DOT__rd_hold_last);
+        signals_.mem_wr_cmd_ready = P(core_mem_wr_cmd_ready);
+        signals_.mem_wr_data_valid = P(core_mem_wr_data_valid);
+        signals_.mem_wr_data_ready = P(core_mem_wr_data_ready);
+        signals_.mem_wr_done = P(core_mem_wr_done);
 #undef P
     }
 
@@ -1723,27 +1724,221 @@ void tick_profiled(Vbnn_sim_top& dut, VerilatedContext& context,
 } // namespace
 
 // -------------------------------------------------------------------------
-// DPI-C virtual memories
+// Host MMIO driver state machine & DPI-C virtual memory
 // -------------------------------------------------------------------------
-extern "C" int cmd_check() {
-    return g_command_cursor < g_commands.size();
+namespace {
+constexpr std::uint16_t kRegCtrlStatus = 0x00;
+constexpr std::uint16_t kRegCycleCnt   = 0x04;
+constexpr std::uint16_t kRegCmdLo      = 0x08;
+constexpr std::uint16_t kRegCmdHi      = 0x0C;
+constexpr std::uint16_t kRegDataBaseLo = 0x10;
+constexpr std::uint16_t kRegDataBaseHi = 0x14;
+constexpr std::uint16_t kRegCmdDoneCnt = 0x18;
+constexpr std::uint16_t kRegErrCode    = 0x1C;
+constexpr std::uint16_t kRegCoreId     = 0x20;
+
+constexpr std::uint32_t kCoreMagicId   = 0x424E4E32u; // "BNN2"
+constexpr std::uint32_t kCtrlLaunch    = 1u << 0;
+constexpr std::uint32_t kCtrlDone      = 1u << 1;
+constexpr std::uint32_t kCtrlError     = 1u << 3;
+constexpr std::uint32_t kCtrlSoftReset = 1u << 4;
+constexpr std::uint64_t kPollInterval  = 128;
+
+enum class HostPhase {
+    BOOT_READ_ID,
+    BOOT_SOFT_RESET,
+    BOOT_BASE_LO,
+    BOOT_BASE_HI,
+    CMD_WRITE_LO,
+    CMD_WRITE_HI,
+    CMD_LAUNCH,
+    CMD_POLL_STATUS,
+    CMD_READ_ERR,
+    FINAL_READ_DONE_CNT,
+    FINAL_READ_CYCLE_CNT,
+    FINISHED
+};
+
+struct HostMmioDriver {
+    HostPhase phase = HostPhase::BOOT_READ_ID;
+    bool in_flight = false;
+    bool dut_busy = false;
+    std::uint64_t busy_poll_wait = 0;
+    std::uint32_t hw_cycle_cnt = 0;
+    std::uint32_t last_err_code = 0;
+    bool failed = false;
+    std::string fail_reason;
+
+    static std::uint64_t pack_req(bool is_write, std::uint16_t addr,
+                                  std::uint32_t wdata = 0,
+                                  std::uint8_t wstrb = 0xFu) {
+        return (std::uint64_t{is_write ? 1u : 0u} << 56) |
+               (std::uint64_t{wstrb & 0xFu} << 48) |
+               (std::uint64_t{addr} << 32) |
+               std::uint64_t{wdata};
+    }
+
+    void on_cycle(bool busy) {
+        dut_busy = busy;
+        if (busy && busy_poll_wait > 0)
+            --busy_poll_wait;
+        else if (!busy)
+            busy_poll_wait = 0;
+    }
+
+    bool has_request() const {
+        if (in_flight || failed || phase == HostPhase::FINISHED)
+            return false;
+        if (phase == HostPhase::CMD_POLL_STATUS && dut_busy && busy_poll_wait > 0)
+            return false;
+        return true;
+    }
+
+    std::uint64_t next_request() {
+        if (!has_request())
+            dpi_fatal("mmio_req_get() called with no ready MMIO request");
+        in_flight = true;
+        switch (phase) {
+        case HostPhase::BOOT_READ_ID:
+            return pack_req(false, kRegCoreId);
+        case HostPhase::BOOT_SOFT_RESET:
+            return pack_req(true, kRegCtrlStatus, kCtrlSoftReset);
+        case HostPhase::BOOT_BASE_LO:
+            return pack_req(true, kRegDataBaseLo,
+                            static_cast<std::uint32_t>(g_data_base));
+        case HostPhase::BOOT_BASE_HI:
+            return pack_req(true, kRegDataBaseHi,
+                            static_cast<std::uint32_t>(g_data_base >> 32));
+        case HostPhase::CMD_WRITE_LO:
+            return pack_req(true, kRegCmdLo,
+                            static_cast<std::uint32_t>(g_commands[g_command_cursor]));
+        case HostPhase::CMD_WRITE_HI:
+            return pack_req(
+                true, kRegCmdHi,
+                static_cast<std::uint32_t>(g_commands[g_command_cursor] >> 32));
+        case HostPhase::CMD_LAUNCH:
+            return pack_req(true, kRegCtrlStatus, kCtrlLaunch);
+        case HostPhase::CMD_POLL_STATUS:
+            return pack_req(false, kRegCtrlStatus);
+        case HostPhase::CMD_READ_ERR:
+            return pack_req(false, kRegErrCode);
+        case HostPhase::FINAL_READ_DONE_CNT:
+            return pack_req(false, kRegCmdDoneCnt);
+        case HostPhase::FINAL_READ_CYCLE_CNT:
+            return pack_req(false, kRegCycleCnt);
+        case HostPhase::FINISHED:
+            break;
+        }
+        dpi_fatal("unreachable HostMmioDriver phase");
+    }
+
+    void on_response(bool is_write, std::uint32_t rdata, std::uint32_t resp) {
+        if (!in_flight)
+            dpi_fatal("mmio_resp_put() called with no in-flight MMIO request");
+        in_flight = false;
+        if (resp != 0) {
+            failed = true;
+            fail_reason = "AXI4-Lite slave returned non-OKAY resp=" +
+                          std::to_string(resp);
+            return;
+        }
+        (void)is_write;
+
+        switch (phase) {
+        case HostPhase::BOOT_READ_ID:
+            if (rdata != kCoreMagicId) {
+                failed = true;
+                fail_reason = "unexpected CORE_ID " + hex_value(rdata);
+                return;
+            }
+            phase = HostPhase::BOOT_SOFT_RESET;
+            break;
+        case HostPhase::BOOT_SOFT_RESET:
+            phase = HostPhase::BOOT_BASE_LO;
+            break;
+        case HostPhase::BOOT_BASE_LO:
+            phase = HostPhase::BOOT_BASE_HI;
+            break;
+        case HostPhase::BOOT_BASE_HI:
+            phase = g_commands.empty() ? HostPhase::FINAL_READ_DONE_CNT
+                                       : HostPhase::CMD_WRITE_LO;
+            break;
+        case HostPhase::CMD_WRITE_LO:
+            phase = HostPhase::CMD_WRITE_HI;
+            break;
+        case HostPhase::CMD_WRITE_HI:
+            phase = HostPhase::CMD_LAUNCH;
+            break;
+        case HostPhase::CMD_LAUNCH:
+            busy_poll_wait = kPollInterval;
+            phase = HostPhase::CMD_POLL_STATUS;
+            break;
+        case HostPhase::CMD_POLL_STATUS:
+            if (rdata & kCtrlError) {
+                phase = HostPhase::CMD_READ_ERR;
+            } else if (rdata & kCtrlDone) {
+                ++g_command_cursor;
+                phase = (g_command_cursor < g_commands.size())
+                            ? HostPhase::CMD_WRITE_LO
+                            : HostPhase::FINAL_READ_DONE_CNT;
+            } else {
+                busy_poll_wait = kPollInterval;
+            }
+            break;
+        case HostPhase::CMD_READ_ERR:
+            last_err_code = rdata;
+            failed = true;
+            fail_reason = "SoC reported command/AXI error (ERR_CODE=" +
+                          hex_value(rdata) + ") at command " +
+                          std::to_string(g_command_cursor);
+            break;
+        case HostPhase::FINAL_READ_DONE_CNT:
+            if (rdata != static_cast<std::uint32_t>(g_commands.size())) {
+                failed = true;
+                fail_reason = "CMD_DONE_CNT mismatch: got " +
+                              std::to_string(rdata) + ", expected " +
+                              std::to_string(g_commands.size());
+                return;
+            }
+            phase = HostPhase::FINAL_READ_CYCLE_CNT;
+            break;
+        case HostPhase::FINAL_READ_CYCLE_CNT:
+            hw_cycle_cnt = rdata;
+            phase = HostPhase::FINISHED;
+            break;
+        case HostPhase::FINISHED:
+            break;
+        }
+    }
+};
+
+HostMmioDriver g_driver;
+} // namespace
+
+extern "C" int mmio_req_check() {
+    return g_driver.has_request() ? 1 : 0;
 }
 
-extern "C" unsigned long long cmd_get() {
-    if (g_command_cursor >= g_commands.size())
-        dpi_fatal("cmd_get() called with no pending instruction");
-    return g_commands[g_command_cursor++];
+extern "C" unsigned long long mmio_req_get() {
+    return g_driver.next_request();
+}
+
+extern "C" void mmio_resp_put(int is_write, unsigned int rdata, unsigned int resp) {
+    g_driver.on_response(is_write != 0, rdata, resp);
 }
 
 extern "C" unsigned long long data_read(unsigned long long address) {
     if ((address & 7ull) != 0)
         dpi_fatal("data_read() address is not 8-byte aligned");
-    if (!range_ok(address, 8))
-        dpi_range_fatal("data_read()", address);
+    if (address < g_data_base)
+        dpi_range_fatal("data_read() below data_base", address);
+    const std::uint64_t offset = address - g_data_base;
+    if (!range_ok(offset, 8))
+        dpi_range_fatal("data_read()", offset);
 
     std::uint64_t value = 0;
     for (int b = 0; b < 8; ++b)
-        value |= std::uint64_t{g_memory[address + b]} << (8 * b);
+        value |= std::uint64_t{g_memory[offset + b]} << (8 * b);
     return value;
 }
 
@@ -1751,23 +1946,26 @@ extern "C" unsigned long long data_read(unsigned long long address) {
 // prefetch hook only exists for network-backed testbenches.
 extern "C" void data_read_burst(unsigned long long address,
                                 unsigned long long bytes) {
-    (void)address;
-    (void)bytes;
+    if (address < g_data_base || !range_ok(address - g_data_base, bytes))
+        dpi_range_fatal("data_read_burst()", address);
 }
 
 extern "C" void data_write(unsigned long long address, unsigned long long data,
                            unsigned char strobe) {
     if ((address & 7ull) != 0)
         dpi_fatal("data_write() address is not 8-byte aligned");
-    if (!range_ok(address, 8))
-        dpi_range_fatal("data_write()", address);
+    if (address < g_data_base)
+        dpi_range_fatal("data_write() below data_base", address);
+    const std::uint64_t offset = address - g_data_base;
+    if (!range_ok(offset, 8))
+        dpi_range_fatal("data_write()", offset);
 
     for (int b = 0; b < 8; ++b) {
         if (strobe & (1u << b))
-            g_memory[address + b] = static_cast<std::uint8_t>(data >> (8 * b));
+            g_memory[offset + b] = static_cast<std::uint8_t>(data >> (8 * b));
     }
     g_highest_write_end = std::max(
-        g_highest_write_end, static_cast<std::uint64_t>(address + 8));
+        g_highest_write_end, static_cast<std::uint64_t>(offset + 8));
 }
 
 // -------------------------------------------------------------------------
@@ -1780,6 +1978,7 @@ struct Options {
     bool write_model = true;
     bool profile = true;
     int top_n = 10;
+    std::uint64_t data_base = 0;
 };
 
 void print_usage(const char* program) {
@@ -1790,6 +1989,7 @@ void print_usage(const char* program) {
         << "  MEMORY        raw binary memory image loaded at address 0\n"
         << "  default       MEMORY stem + \"_out\" + extension\n"
         << "options:\n"
+        << "  --data-base HEX   physical base address written to DATA_BASE (default 0)\n"
         << "  --no-model        do not write the output memory image\n"
         << "  --no-profile      disable trace/folded/report generation\n"
         << "  --trace PATH      Chrome trace JSON (default <stem>_trace.json)\n"
@@ -1811,6 +2011,10 @@ Options parse_options(int argc, char** argv) {
             options.write_model = false;
         } else if (argument == "--no-profile") {
             options.profile = false;
+        } else if (argument == "--data-base") {
+            if (++i >= argc)
+                throw std::runtime_error("--data-base requires a value");
+            options.data_base = std::stoull(argv[i], nullptr, 0);
         } else if (argument == "--top") {
             if (++i >= argc)
                 throw std::runtime_error("--top requires a value");
@@ -1860,10 +2064,13 @@ int main(int argc, char** argv) {
 
         g_commands = load_commands(options.instructions);
         g_memory = load_memory(options.memory);
+        g_data_base = options.data_base;
+        g_driver = HostMmioDriver{};
 
         std::cout << "commands: " << g_commands.size()
                   << ", memory image: " << g_initial_memory_size
-                  << " bytes (capacity " << g_memory.size() << ")\n";
+                  << " bytes (capacity " << g_memory.size()
+                  << ", data_base " << hex_value(g_data_base) << ")\n";
 
         VerilatedContext context;
         context.commandArgs(1, argv);
@@ -1885,10 +2092,11 @@ int main(int argc, char** argv) {
 
         std::uint64_t cycles = 0;
         while (!context.gotFinish() && cycles < kCycleLimit) {
-            dut.finish = g_command_cursor >= g_commands.size() ? 1 : 0;
+            g_driver.on_cycle(dut.busy_out != 0);
+            dut.finish = (g_driver.phase == HostPhase::FINISHED) ? 1 : 0;
             tick_profiled(dut, context, profiler.get(), cycles);
-            if (dut.cmd_error_out)
-                throw std::runtime_error("core reported cmd_error");
+            if (g_driver.failed)
+                throw std::runtime_error(g_driver.fail_reason);
             ++cycles;
         }
         if (!context.gotFinish())
@@ -1930,7 +2138,8 @@ int main(int argc, char** argv) {
         }
 
         std::cout << "finished: " << g_command_cursor << " commands, "
-                  << cycles << " cycles";
+                  << cycles << " cycles (hw CYCLE_CNT=" << g_driver.hw_cycle_cnt
+                  << ")";
         if (options.write_model)
             std::cout << " -> " << output_path.string() << " ("
                       << output_size << " bytes)";

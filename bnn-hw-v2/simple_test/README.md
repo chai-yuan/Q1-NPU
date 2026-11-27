@@ -57,6 +57,6 @@ atol = 1e-5, rtol = 1e-6
 当前 RTL 的 FP32 路径采用 FTZ + RTZ，而 golden 采用 RNE；实测最大相对误差
 `1.45e-7`（`full_i8`，2 ulp），`tile_i8` / `tile_f32` 逐位一致。
 
-`baseline_cycles.txt` 记录当前 RTL 的基线总周期（106047）。`make test`
+`baseline_cycles.txt` 记录当前 `bnn_soc_top`（含 AXI4-Lite MMIO 直推与 64-bit AXI4 突发桥接）的基线总周期（106868，其中硬件 `CYCLE_CNT` 为 106144）。`make test`
 会打印本次周期数与相对基线的变化，便于后续性能分析；周期变化不会导致失败；`make gen`
 不会覆盖该文件。
